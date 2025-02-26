@@ -2,44 +2,61 @@
 
 FROM NrMTDConsumption --Consumption data from the NrMTDConsumption event type which will give us the last known billable users count for the current month
     LEFT JOIN ( 
-        SELECT
-            sum(
-                 if((`latestChange` = 'Full' or `latestChange` = 'Basic') and (`earlistFrom` = 'Basic' or `earlistFrom` = 'Core' or `earlistFrom` is null), 
-                     if(`latestChange` = 'Full' and (`earlistFrom` = 'Basic' or `earlistFrom` = 'Core' or `earlistFrom` is null), 1, 0), -1) as FSOCount
 
-               ) as FSOCount, --license allocation logic; add 1 if latest change is 'Full' and earliest type was 'Basic' or 'Core'; subtract 1 otherwise
-            sum(userUpgradeFlag) as 'upgradeCount',
-            sum(userUpgradeFlagFull) as 'fullUpgradeCount',
-            sum(userUpgradeFlagCore) as 'coreUpgradeCount',
-            sum(userDowngradeFlag) as 'fullDowngradeCount',
-            sum(userCreatedFlag) as 'createdCount',
-            sum(userDeletedFlag) as 'deletedCount'
+        SELECT
+               sum(
+                   if ((`changedFrom` = 'Basic' OR `changedFrom` = 'Core' OR `changedFrom` IS NULL) AND (`changedTo` = 'Full' OR`changedTo` = 'Basic' OR`changedTo` IS NULL) OR `userDeleted` = 1 OR`userCreatedWithFull` = 1,
+                    if (( `changedFrom` = 'Basic'  OR `changedFrom` = 'Core'  OR (`changedFrom` IS NULL AND `userCreatedWithFull` = 1)) AND ( `changedTo` = 'Full'  OR (`changedTo` IS NULL AND `userCreatedWithFull` = 1)),1,0),-1)
+                  ) as FSOCount, 
+
+            sum(userUpgradeFromBasicToFull) as 'userUpgradeFromBasicToFull',
+            sum(userUpgradeFromCoreToFull) as 'userUpgradeFromCoreToFull',
+            sum(userDowngradeFromFulltoBasic) as 'userDowngradeFromFulltoBasic',
+            sum(userDowngradeFromFulltoCore) as 'userDowngradeFromFulltoCore',
+            sum(userDowngradeFromCoretoBasic) as 'userDowngradeFromCoretoBasic',
+            sum(userCreatedWithFull) as 'userCreatedWithFull',
+            sum(userCreatedWithCore) as 'userCreatedWithCore',
+            sum(userCreatedWithBasic) as 'userCreatedWithBasic',
+            sum(userDeleted) as 'userDeleted'
              
         FROM -- Subquery to allow sum() aggregation above
             ( 
-                FROM NrAuditEvent -- Query the NrAuditEvent event type for audit data
+FROM NrAuditEvent -- Query the NrAuditEvent event type for audit data
                 WITH 
-                    aparse(description, 'User * type was changed from * to *.') as (`email1`, `from`, `to1`), -- Parse 'description' to extract user email, previous userType, and new userType
-                    aparse(description, 'User * was created with user type *.') as (`email2`, `to2`), -- Parse 'description' to extract user email, previous userType, and new userType
-                    aparse(description, 'User * was *.') as (`email3`, `action`), 
-                    if(description LIKE 'User % was%', if(description LIKE 'User % was created%', email2, email1), email3) as `email`,
-                    if(to1 is null, to2, to1) as `to`,
+                    //Parse the three different types of userType impacting events 
+                    aparse(description, 'User * type was changed from * to *.') as (`changedEmail`, `changedFrom`, `changedTo`), 
+                    aparse(description, 'User * was created with user type *.') as (`createdEmail`, `createdWith`),
+                    aparse(description, 'User * was deleted.') as (`deletedEmail`),
+                    
+                    //Consolidate the common variables into a single attribute
+                    if(changedEmail is not null or createdEmail is not null, if(changedEmail is not null, changedEmail, createdEmail), deletedEmail) as `email`,
+                    if(changedTo is null, createdWith, changedTo) as `userType`,
 
-                    if(description LIKE 'User % type was changed from Basic to Full.', 1,0) as userUpgradeFlagFull,
-                    if(description LIKE 'User % type was changed from Core to Full.', 1,0) as userUpgradeFlagCore,
-                    if(userUpgradeFlagFull = 1 or userUpgradeFlagCore = 1, 1, 0) as userUpgradeFlag,
-                    if(description LIKE 'User % type was changed from Full to Basic.', 1, 0) as userDowngradeFlagBasic,
-                    if(description LIKE 'User % was created with user type Full.', 1,0) as userCreatedFlag,
-                    if(description LIKE '%was deleted.', 1,0) as userDeletedFlag
+                    //Actin logic per userType impacting events
+                    if(`changedFrom` = 'Basic' and `changedTo` = 'Full', 1,0) as userUpgradeFromBasicToFull,
+                    if(`changedFrom` = 'Core' and `changedTo` = 'Full', 1,0) as userUpgradeFromCoreToFull,
+                    if(`changedFrom` = 'Full' and `changedTo` = 'Basic', 1,0) as userDowngradeFromFulltoBasic,
+                    if(`changedFrom` = 'Full' and `changedTo` = 'Core', 1,0) as userDowngradeFromFulltoCore,
+                    if(`changedFrom` = 'Core' and `changedTo` = 'Basic', 1,0) as userDowngradeFromCoretoBasic,
+                    if(`createdWith` = 'Full', 1,0) as userCreatedWithFull,
+                    if(`createdWith` = 'Core', 1,0) as userCreatedWithCore,
+                    if(`createdWith` = 'Basic', 1,0) as userCreatedWithBasic,
+                    if(description LIKE '%was deleted.', 1,0) as userDeleted
 
-                SELECT
-                    latest(`to`) as latestChange, -- Capture the most recent new type (i.e., latest change)
-                    earliest(`from`) as earlistFrom, -- Capture the original type before any changes
-                    latest(userUpgradeFlag) as userUpgradeFlag, 
-                    latest(userDowngradeFlagBasic) as userDowngradeFlag,
-                    latest(userCreatedFlag) as userCreatedFlag,
-                    latest(userDeletedFlag) as userDeletedFlag,
-                    latest(accountId()) as accountId -- Retrieve the associated account ID for the JOIN (since this data is only available in the NrAuditEvent from the master account, this join value will always match the masterAccountId in the NrMTDConsumption event
+                SELECT 
+                    earliest(`changedFrom`) as 'changedFrom',
+                    latest(`changedTo`) as 'changedTo',
+                    filter(count(`userUpgradeFromBasicToFull`), WHERE userUpgradeFromBasicToFull = 1) as 'userUpgradeFromBasicToFull',
+                    filter(count(`userUpgradeFromCoreToFull`), WHERE userUpgradeFromCoreToFull = 1) as 'userUpgradeFromCoreToFull',
+                    filter(count(`userDowngradeFromFulltoBasic`), WHERE userDowngradeFromFulltoBasic = 1) as 'userDowngradeFromFulltoBasic',
+                    filter(count(`userDowngradeFromFulltoCore`), WHERE userDowngradeFromFulltoCore = 1) as 'userDowngradeFromFulltoCore',
+                    filter(count(`userDowngradeFromCoretoBasic`), WHERE userDowngradeFromCoretoBasic = 1) as 'userDowngradeFromCoretoBasic',
+                    filter(count(`userCreatedWithFull`), WHERE userCreatedWithFull = 1) as 'userCreatedWithFull',
+                    filter(count(`userCreatedWithCore`), WHERE userCreatedWithCore = 1) as 'userCreatedWithCore',
+                    filter(count(`userCreatedWithBasic`), WHERE userCreatedWithBasic = 1) as 'userCreatedWithBasic',
+                    filter(count(`userDeleted`), WHERE userDeleted = 1) as 'userDeleted',
+                    latest(accountId()) as accountId
+
                 WHERE
                     description LIKE '% type was changed from %' or description LIKE '%created with user type%' or description LIKE '%was deleted.'-- Filter for events that involve a userType change for both self tier upgrade and admin performed ugprade
                 WHERE
@@ -58,12 +75,17 @@ if(FSOCount is null, 0, FSOCount) as FSOCountChecked
 
 SELECT 
 
-earliest(FullPlatformUsersBillable) as 'Start of Month FSO Count',
-(latest(FSOCountChecked) + earliest(FullPlatformUsersBillable)) as 'FSO Count as of Now', -- Take the current license allocation movements from NrAuditEvent for this month and sum them to the last known full monthly billable users count from NrMTDConsumption
-latest(upgradeCount) as 'No. of Upgrades',
-latest(fullDowngradeCount) as 'No. of Downgrades',
-latest(createdCount) as 'No. of User Creations (Full)',
-latest(deletedCount) as 'No. of Deleted Users (this will not reflect in "FSO Count as of Now"'
+    earliest(FullPlatformUsersBillable) as 'Start of Month FSO Count',
+    (latest(FSOCountChecked) + earliest(FullPlatformUsersBillable)) as 'FSO Count as of Now', -- Take the current license allocation movements from NrAuditEvent for this month and sum them to the last known full monthly billable users count from NrMTDConsumption
+    latest(userUpgradeFromBasicToFull) as 'Number of Basic to Full Actions',
+    latest(userUpgradeFromCoreToFull) as 'Number of Core to Full Actions',
+    latest(userDowngradeFromFulltoBasic) as 'Number of Full to Basic Actions',
+    latest(userDowngradeFromFulltoCore) as 'Number of Full to Core Actions',
+    latest(userDowngradeFromCoretoBasic) as 'Number of Core to Basic Actions',
+    latest(userCreatedWithFull) as 'Users created with Full',
+    latest(userCreatedWithCore) as 'Users created with Core',
+    latest(userCreatedWithBasic) as 'Users created with Basic',
+    latest(userDeleted) as 'No. of Deleted Users (this will not reflect in "FSO Count as of Now"'
 
 
 -- For the outter NrMTDConsumption query, limit the time window to last month because we only want the latest(FullPlatformUsersBillable)
